@@ -1,0 +1,121 @@
+From 582f1fb6b721facf04848d2ca57f34468da1813e Mon Sep 17 00:00:00 2001
+From: Giuseppe Scrivano <gscrivan@redhat.com>
+Date: Wed, 18 Nov 2020 11:47:45 +0100
+Subject: [PATCH] fs, close_range: add flag CLOSE_RANGE_CLOEXEC
+
+When the flag CLOSE_RANGE_CLOEXEC is set, close_range doesn't
+immediately close the files but it sets the close-on-exec bit.
+
+It is useful for e.g. container runtimes that usually install a
+seccomp profile "as late as possible" before execv'ing the container
+process itself.  The container runtime could either do:
+  1                                  2
+- install_seccomp_profile();       - close_range(MIN_FD, MAX_INT, 0);
+- close_range(MIN_FD, MAX_INT, 0); - install_seccomp_profile();
+- execve(...);                     - execve(...);
+
+Both alternative have some disadvantages.
+
+In the first variant the seccomp_profile cannot block the close_range
+syscall, as well as opendir/read/close/... for the fallback on older
+kernels.
+In the second variant, close_range() can be used only on the fds
+that are not going to be needed by the runtime anymore, and it must be
+potentially called multiple times to account for the different ranges
+that must be closed.
+
+Using close_range(..., ..., CLOSE_RANGE_CLOEXEC) solves these issues.
+The runtime is able to use the existing open fds, the seccomp profile
+can block close_range() and the syscalls used for its fallback.
+
+Signed-off-by: Giuseppe Scrivano <gscrivan@redhat.com>
+Link: https://lore.kernel.org/r/20201118104746.873084-2-gscrivan@redhat.com
+Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+---
+ fs/file.c                        | 44 ++++++++++++++++++++++++--------
+ include/uapi/linux/close_range.h |  3 +++
+ 2 files changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/fs/file.c b/fs/file.c
+index 4559b5fec3bd53..e08e4daccac327 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -674,6 +674,35 @@ int __close_fd(struct files_struct *files, unsigned fd)
+ }
+ EXPORT_SYMBOL(__close_fd); /* for ksys_close() */
+ 
++static inline void __range_cloexec(struct files_struct *cur_fds,
++				   unsigned int fd, unsigned int max_fd)
++{
++	struct fdtable *fdt;
++
++	if (fd > max_fd)
++		return;
++
++	spin_lock(&cur_fds->file_lock);
++	fdt = files_fdtable(cur_fds);
++	bitmap_set(fdt->close_on_exec, fd, max_fd - fd + 1);
++	spin_unlock(&cur_fds->file_lock);
++}
++
++static inline void __range_close(struct files_struct *cur_fds, unsigned int fd,
++				 unsigned int max_fd)
++{
++	while (fd <= max_fd) {
++		struct file *file;
++
++		file = pick_file(cur_fds, fd++);
++		if (!file)
++			continue;
++
++		filp_close(file, cur_fds);
++		cond_resched();
++	}
++}
++
+ /**
+  * __close_range() - Close all file descriptors in a given range.
+  *
+@@ -689,7 +718,7 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
+ 	struct task_struct *me = current;
+ 	struct files_struct *cur_fds = me->files, *fds = NULL;
+ 
+-	if (flags & ~CLOSE_RANGE_UNSHARE)
++	if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC))
+ 		return -EINVAL;
+ 
+ 	if (fd > max_fd)
+@@ -727,16 +756,11 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
+ 	}
+ 
+ 	max_fd = min(max_fd, cur_max);
+-	while (fd <= max_fd) {
+-		struct file *file;
+ 
+-		file = pick_file(cur_fds, fd++);
+-		if (!file)
+-			continue;
+-
+-		filp_close(file, cur_fds);
+-		cond_resched();
+-	}
++	if (flags & CLOSE_RANGE_CLOEXEC)
++		__range_cloexec(cur_fds, fd, max_fd);
++	else
++		__range_close(cur_fds, fd, max_fd);
+ 
+ 	if (fds) {
+ 		/*
+diff --git a/include/uapi/linux/close_range.h b/include/uapi/linux/close_range.h
+index 6928a9fdee3c45..2d804281554c5c 100644
+--- a/include/uapi/linux/close_range.h
++++ b/include/uapi/linux/close_range.h
+@@ -5,5 +5,8 @@
+ /* Unshare the file descriptor table before closing file descriptors. */
+ #define CLOSE_RANGE_UNSHARE	(1U << 1)
+ 
++/* Set the FD_CLOEXEC bit instead of closing the file descriptor. */
++#define CLOSE_RANGE_CLOEXEC	(1U << 2)
++
+ #endif /* _UAPI_LINUX_CLOSE_RANGE_H */
+ 
