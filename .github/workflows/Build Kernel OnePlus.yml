@@ -798,6 +798,30 @@ jobs:
           source $REJ_CHECKER
           check_rejects .
 
+      - name: Apply Hotspot Fix Patches
+        run: |
+          cd kernel_workspace/kernel_platform/common
+          
+          echo "========================================================"
+          echo "当前工作目录: $(pwd)"
+          echo "环境变量 GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          echo "========================================================"
+          
+          echo "--- 检查绝对路径下的文件是否存在 ---"
+          ls -la $GITHUB_WORKSPACE/patches/hotspot_fix/ || echo "❌ 绝对路径下未找到文件！"
+          
+          echo "--- 检查相对路径下的文件是否存在 ---"
+          ls -la ../../../patches/hotspot_fix/ || echo "❌ 相对路径下未找到文件！"
+          echo "========================================================"
+
+          echo "开始应用补丁..."
+          patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/hotspot_fix/close_range_cloexec.patch || true
+          patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/hotspot_fix/close_range_fix.patch || true
+          echo "hotspot_fix_patch 完成"
+          
+          source $REJ_CHECKER
+          check_rejects .
+
       - name: Revert and Postfix Fake Patches
         if: ${{ github.event.inputs.SUSFS_META != '-1' }}
         run: |
